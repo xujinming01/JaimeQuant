@@ -31,6 +31,8 @@ class VectorbtRotationStrategy:
         
         # 存放原始数据的容器
         self.prices = None 
+        self.highs = None
+        self.lows = None
         
         # 初始化加载数据
         self._load_data()
@@ -39,7 +41,7 @@ class VectorbtRotationStrategy:
         """从 SQLite 数据库提取数据并转为 vectorbt 最喜欢的宽表 (Wide DataFrame)"""
         print("📥 正在从本地数据库加载数据...")
         conn = sqlite3.connect(self.db_path)
-        df_list = []
+        df_close_list, df_high_list, df_low_list = [], [], []
         
         # 确定需要加载的所有标的（风险资产池 + 单独指定的避险资产）
         all_codes = self.code_list.copy()
@@ -48,21 +50,27 @@ class VectorbtRotationStrategy:
             
         for code in all_codes:
             try:
-                query = f'SELECT 日期, 收盘 FROM "{code}"'
+                query = f'SELECT 日期, 最高, 最低, 收盘 FROM "{code}"'
                 df = pd.read_sql(query, conn)
                 df['日期'] = pd.to_datetime(df['日期'])
                 df = df[(df['日期'] >= self.start_date) & (df['日期'] <= self.end_date)]
                 
                 df = df.set_index('日期')
-                df.rename(columns={'收盘': code}, inplace=True)
-                df_list.append(df)
+                
+                # 分别存放收盘、最高、最低
+                df_close_list.append(df[['收盘']].rename(columns={'收盘': code}))
+                df_high_list.append(df[['最高']].rename(columns={'最高': code}))
+                df_low_list.append(df[['最低']].rename(columns={'最低': code}))
+                
             except Exception as e:
                 print(f"⚠️ 读取 {code} 失败: {e}")
                 
         conn.close()
         
         # 合并所有标的，采用外连接保证日期对齐，前向填充缺失值
-        self.prices = pd.concat(df_list, axis=1).sort_index().ffill()
+        self.prices = pd.concat(df_close_list, axis=1).sort_index().ffill()
+        self.highs = pd.concat(df_high_list, axis=1).sort_index().ffill()
+        self.lows = pd.concat(df_low_list, axis=1).sort_index().ffill()
         print(f"✅ 数据加载完成，形状: {self.prices.shape}")
 
 
@@ -77,25 +85,41 @@ class VectorbtRotationStrategy:
         return factor_df
 
     def factor_atr_dynamic_score(self, lb_min=10, lb_max=60, vol_short_len=10, vol_long_len=60, ratio_cap=0.9):
-        """复杂因子：复现你原先的 ATR 动态回溯窗口得分计算逻辑"""
-        print(f"🧮 计算因子: ATR动态窗口回归得分...")
+        """复杂因子：基于真实 ATR 计算动态回溯窗口得分"""
+        print(f"🧮 计算因子: 基于真实ATR的动态窗口回归得分...")
         
         # 仅针对风险资产计算因子
         risk_prices = self.prices[self.code_list]
+        risk_highs = self.highs[self.code_list]
+        risk_lows = self.lows[self.code_list]
         
-        # 1. 计算日收益率和波动率矩阵
-        returns = risk_prices.pct_change()
-        vol_short = returns.rolling(vol_short_len).std()
-        vol_long = returns.rolling(vol_long_len).std()
+        # 计算 True Range (TR) 和 ATR
+        prev_close = risk_prices.shift(1)
         
-        # 2. 计算动态窗口大小
-        vol_ratio_capped = (vol_short / vol_long).clip(upper=ratio_cap)
+        tr1 = risk_highs - risk_lows
+        tr2 = (risk_highs - prev_close).abs()
+        tr3 = (risk_lows - prev_close).abs()
+        
+        # 取三者的最大值为当天的 TR
+        tr = pd.DataFrame(
+            np.maximum(tr1.values, np.maximum(tr2.values, tr3.values)),
+            index=risk_prices.index,
+            columns=risk_prices.columns
+        )
+        
+        # 计算短长周期的 ATR
+        atr_short = tr.rolling(vol_short_len).mean()
+        atr_long = tr.rolling(vol_long_len).mean()
+        
+        # 计算动态窗口大小 
+        vol_ratio = atr_short / atr_long
+        vol_ratio_capped = vol_ratio.clip(upper=ratio_cap)
         lookback_df = np.floor(lb_min + (lb_max - lb_min) * (1 - vol_ratio_capped)).fillna(lb_max).astype(int)
         
         # 准备因子矩阵
         factor_df = pd.DataFrame(np.nan, index=risk_prices.index, columns=self.code_list)
         
-        # 3. 纯 Numpy 加速的得分计算函数
+        # 纯 Numpy 加速的得分计算函数
         def fast_score(y):
             if len(y) < 2 or y[0] == 0: return np.nan
             y_norm = y / y[0]
@@ -108,7 +132,7 @@ class VectorbtRotationStrategy:
             r_squared = np.corrcoef(x, y_norm)[0, 1] ** 2
             return 10000 * slope * r_squared
             
-        # 4. 滚动计算得分
+        # 滚动计算得分
         for code in self.code_list:
             prices_arr = risk_prices[code].values
             lookback_arr = lookback_df[code].values
@@ -199,7 +223,7 @@ class VectorbtRotationStrategy:
 if __name__ == "__main__":
     
     # 1. 配置参数 (请确保路径对齐你的项目结构)
-    DB_PATH = 'code/database/dayK.db'
+    DB_PATH = 'JaimeQuant/database/dayK.db'
     
     # 💡纯净的字典：只存放参与横向打分排名的风险资产
     ETF_DICT = {
@@ -224,14 +248,15 @@ if __name__ == "__main__":
         end_date='20260301'
     )
     
-    factor_atr = strategy.factor_atr_dynamic_score()  # ATR 动态窗口得分因子 (现在底层严格只算 ETF_DICT 里的风险资产)
+    # factor_momentum = strategy.factor_pure_momentum(window=20)  # 20日纯动量因子
+    factor_atr = strategy.factor_atr_dynamic_score()  # ATR 动态窗口得分因子
     
     # 3. 生成目标权重 
     weights_atr = strategy.generate_target_weights(
         factor_atr, 
         top_n=1,  
         # enable_absolute_momentum=True, 
-        absolute_threshold=0.0         
+        # absolute_threshold=0         
     )
     
     pf_atr = strategy.run_backtest(weights_atr, init_cash=100000, fees=0.00006)
@@ -247,17 +272,17 @@ if __name__ == "__main__":
     strategy_returns = pf_atr.returns()
     benchmark_returns = strategy.prices[BENCHMARK_CODE].pct_change().fillna(0)
     strategy_returns, benchmark_returns = strategy_returns.align(benchmark_returns, join='inner')
-    
-    report_name = f"VectorBT_ATR_Rotation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    report_path = os.path.join(script_dir, report_name)
-    
-    qs.reports.html(
-        returns=strategy_returns, 
-        benchmark=benchmark_returns, 
-        title=REPORT_TITLE, 
-        output=report_path
-    )
-    print(f"✅ 报告已生成并保存至: {report_path}")
+    qs.reports.metrics(strategy_returns, benchmark=benchmark_returns, mode='basic')
+
+    # report_name = f"VectorBT_ATR_Rotation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+    # script_dir = os.path.dirname(os.path.abspath(__file__))
+    # report_path = os.path.join(script_dir, report_name)
+    # qs.reports.html(
+    #     returns=strategy_returns, 
+    #     benchmark=benchmark_returns, 
+    #     title=REPORT_TITLE, 
+    #     output=report_path
+    # )
+    # print(f"✅ 报告已生成并保存至: {report_path}")
 
     # pf_atr.plot().show()
