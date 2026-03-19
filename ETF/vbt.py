@@ -84,7 +84,7 @@ class VectorbtRotationStrategy:
         factor_df = risk_prices / risk_prices.shift(window) - 1.0
         return factor_df
 
-    def factor_atr_dynamic_score(self, lb_min=10, lb_max=60, vol_short_len=10, vol_long_len=60, ratio_cap=0.9):
+    def factor_atr_dynamic_score(self, lb_min=20, lb_max=60, vol_short_len=20, vol_long_len=60, ratio_cap=0.9):
         """复杂因子：基于真实 ATR 计算动态回溯窗口得分"""
         print(f"🧮 计算因子: 基于真实ATR的动态窗口回归得分...")
         
@@ -147,20 +147,179 @@ class VectorbtRotationStrategy:
             
         return factor_df
 
-    # ==================== 信号与执行 ====================
-
-    def generate_target_weights(self, factor_df, top_n=1, enable_absolute_momentum=False, absolute_threshold=0.0):
+    def factor_rsrs(self, window=18):
         """
-        根据因子值生成目标权重矩阵。
+        标准 RSRS 因子 (Resistance Support Relative Strength)
+        计算过去 N 天最高价对最低价的回归斜率 (Slope) 及其 R2 增强得分
+        """
+        print(f"🧮 计算因子: {window}日 RSRS 阻力支撑强弱指标...")
+        
+        # 仅针对风险资产获取最高价和最低价矩阵
+        highs = self.highs[self.code_list]
+        lows = self.lows[self.code_list]
+        
+        # ==========================================
+        # 利用数学公式展开进行极速滚动回归 (纯向量化)
+        # X = Lows (自变量), Y = Highs (因变量)
+        # ==========================================
+        
+        # 计算滚动期望 E[X], E[Y]
+        mean_x = lows.rolling(window).mean()
+        mean_y = highs.rolling(window).mean()
+        
+        # 计算滚动期望 E[XY]
+        mean_xy = (lows * highs).rolling(window).mean()
+        
+        # 计算滚动期望 E[X^2], E[Y^2]
+        mean_x2 = (lows ** 2).rolling(window).mean()
+        mean_y2 = (highs ** 2).rolling(window).mean()
+        
+        # 计算协方差 Cov(X,Y) = E[XY] - E[X]E[Y]
+        cov_xy = mean_xy - mean_x * mean_y
+        
+        # 计算方差 Var(X) = E[X^2] - (E[X])^2
+        var_x = mean_x2 - mean_x ** 2
+        var_y = mean_y2 - mean_y ** 2
+        
+        # 避免除以 0 导致无穷大，将 0 替换为 NaN
+        var_x = var_x.replace(0, np.nan)
+        var_y = var_y.replace(0, np.nan)
+        
+        # 1. 计算斜率 Slope (即原始的 RSRS 值)
+        slope = cov_xy / var_x
+        
+        # 2. 计算决定系数 R^2 = Cov(X,Y)^2 / (Var(X) * Var(Y))
+        r_squared = (cov_xy ** 2) / (var_x * var_y)
+        
+        # 3. 计算增强版得分 (Slope * R^2)
+        # 乘以 10000 是为了与你注释中的量纲保持一致，也可去掉
+        rsrs_score = 10000 * slope * r_squared
+        
+        return rsrs_score
+    
+    def factor_rsrs_advanced(self, window=16, z_window=300):
+        """
+        高级 RSRS 因子 (Right-Skewed Standard Score)
+        融合了标准分 (Z-Score)、决定系数 (R2) 和斜率 (Beta) 的终极优化版本。
         
         参数:
-        - factor_df: 因子值 DataFrame (现在里面只包含风险资产)
-        - top_n: 每天选出因子值最大的前 n 只标的
-        - enable_absolute_momentum: 绝对动量开关 (True/False)
-        - absolute_threshold: 绝对动量阈值，仅当开关为 True 时生效
+        window: int, 计算线性回归的窗口期 N (研报右偏版本推荐 16)
+        z_window: int, 计算标准分(Z-Score)的滚动观察期 M (研报右偏版本推荐 300)
+        """
+        print(f"🧮 计算因子: {window}日 RSRS 右偏标准分 (Z观察期: {z_window}日)...")
+        
+        # 仅针对风险资产获取最高价和最低价矩阵
+        highs = self.highs[self.code_list]
+        lows = self.lows[self.code_list]
+        
+        # ==========================================
+        # 1. 极速计算斜率 (Beta) 和 决定系数 (R2)
+        # ==========================================
+        mean_x = lows.rolling(window).mean()
+        mean_y = highs.rolling(window).mean()
+        mean_xy = (lows * highs).rolling(window).mean()
+        mean_x2 = (lows ** 2).rolling(window).mean()
+        mean_y2 = (highs ** 2).rolling(window).mean()
+        
+        cov_xy = mean_xy - mean_x * mean_y
+        var_x = mean_x2 - mean_x ** 2
+        var_y = mean_y2 - mean_y ** 2
+        
+        # 避免除以 0
+        var_x = var_x.replace(0, np.nan)
+        var_y = var_y.replace(0, np.nan)
+        
+        # 计算 Beta (斜率) 和 R2
+        beta = cov_xy / var_x
+        r_squared = (cov_xy ** 2) / (var_x * var_y)
+        
+        # ==========================================
+        # 2. 计算标准分 (Z-Score)
+        # 公式: (当前Beta - 滚动均值) / 滚动标准差
+        # ==========================================
+        # 按照研报逻辑，前期数据不足 M 时，最少使用 20 天的数据计算
+        beta_mean = beta.rolling(z_window, min_periods=20).mean()
+        beta_std = beta.rolling(z_window, min_periods=20).std()
+        
+        beta_std = beta_std.replace(0, np.nan) # 防止除零溢出
+        std_score = (beta - beta_mean) / beta_std
+        
+        # ==========================================
+        # 3. 计算修正标准分 (Modified Z-Score)
+        # 公式: R2 * 标准分
+        # ==========================================
+        mdf_std_score = r_squared * std_score
+        
+        # ==========================================
+        # 4. 计算右偏标准分 (Right-Skewed Z-Score)
+        # 公式: Beta * 修正标准分
+        # ==========================================
+        rsk_std_score = beta * mdf_std_score
+        
+        # 最终返回研报优选的右偏标准分因子矩阵
+        return rsk_std_score
+    
+    # ==================== 过滤器插件 (Filters) ====================
+    
+    def filter_recent_drop(self, max_drop_pct=0.05):
+        """
+        插件：过滤近期出现大幅下跌或连续下跌的ETF
+        参数:
+            - max_drop_pct: float, 最大允许下跌幅度（例如 0.05 代表 5%）
+        返回: pd.DataFrame (bool)。True表示安全(可交易)，False表示危险(需过滤)
+        """
+        # 将跌幅百分比转换为价格比率阈值
+        # 例如 0.05 转换为 0.95
+        drop_threshold = 1.0 - max_drop_pct
+        
+        print(f"🛡️ 计算过滤器: 近期下跌过滤 (最大允许跌幅: {max_drop_pct*100}%)")
+        
+        # 仅针对风险资产计算
+        prices = self.prices[self.code_list]
+        
+        # 计算单日涨跌幅
+        daily_ret = prices / prices.shift(1)
+        
+        # 条件1：近3天内有任意一天跌幅超过 max_drop_pct
+        is_large_drop = daily_ret < drop_threshold
+        con1 = is_large_drop.rolling(window=3).max().fillna(0).astype(bool)
+        
+        # 条件2：连续3天连跌，且3天累计跌幅超过 max_drop_pct
+        is_down = prices < prices.shift(1)
+        three_down = is_down & is_down.shift(1) & is_down.shift(2)
+        three_day_drop = (prices / prices.shift(3)) < drop_threshold
+        con2 = three_down & three_day_drop
+        
+        # 条件3：昨天触发了条件2 (连续3天连跌且累计跌幅过大)
+        con3 = con2.shift(1).fillna(False)
+        
+        # 综合危险信号：满足以上任意一个，即视为危险 (True)
+        is_danger = con1 | con2 | con3
+        
+        # 返回安全白名单 (取反)
+        return ~is_danger
+    
+    # ==================== 信号与执行 ====================
+
+    def generate_target_weights(self, factor_df, top_n=1, enable_absolute_momentum=False, absolute_threshold=0.0, filter_mask=None):
+        """
+        根据因子值生成目标权重矩阵。
+        参数:
+            - factor_df: DataFrame，包含所有风险资产的因子得分
+            - top_n: int，选择因子得分排名前 N 的资产进行投资
+            - enable_absolute_momentum: bool，是否启用绝对动量过滤
+            - absolute_threshold: float，绝对动量的得分阈值，低于此值的资产将被没收权重
+            - filter_mask: DataFrame (bool)，外部过滤器插件的结果，True表示安全，False表示危险。被标记为False的资产将被剔除（权重设为0）。
         """
         print(f"🎯 正在根据因子生成目标权重 (Top {top_n})...")
         
+        # --- 🔌 插件过滤逻辑 (前置拦截) ---
+        if filter_mask is not None:
+            print("🧩 已接入外部过滤器插件，正在剔除高风险标的...")
+            # 将 filter_mask 中为 False (危险) 的位置，在 factor_df 中设为 NaN
+            # 被设为 NaN 的资产将无法参与下方的 Top N 竞争
+            factor_df = factor_df.where(filter_mask, np.nan)
+            
         # 1. 获取所有参与排名的风险资产
         risk_assets = list(factor_df.columns)
         
@@ -227,6 +386,8 @@ if __name__ == "__main__":
     
     # 💡纯净的字典：只存放参与横向打分排名的风险资产
     ETF_DICT = {
+        # '510300': '沪深300ETF华泰柏瑞',
+        # '510500': '中证500ETF',
         '510880': '红利ETF华泰柏瑞',
         '159915': '创业板ETF易方达',
         '513100': '纳指ETF',
@@ -236,7 +397,7 @@ if __name__ == "__main__":
     
     # 单独拿出来定义，不混杂在 ETF_DICT 中
     SAFE_ASSET_CODE = '161119' # 可以设为 None 来全局只空仓
-    REPORT_TITLE = "ETF ATR"
+    REPORT_TITLE = "ETF RSRS Rotation Basic"
     
     # 2. 实例化策略框架
     strategy = VectorbtRotationStrategy(
@@ -244,19 +405,22 @@ if __name__ == "__main__":
         code_dict=ETF_DICT,
         safe_asset_code=SAFE_ASSET_CODE, # 👈 在初始化框架时，以专用通道传入避险资产
         benchmark_code=BENCHMARK_CODE,
-        start_date='20140101',
-        end_date='20260301'
+        start_date='20160101',
+        end_date='20260101',
     )
     
-    # factor_momentum = strategy.factor_pure_momentum(window=20)  # 20日纯动量因子
-    factor_atr = strategy.factor_atr_dynamic_score()  # ATR 动态窗口得分因子
-    
+    # factor = strategy.factor_pure_momentum(window=20)  # 纯动量因子
+    # factor = strategy.factor_atr_dynamic_score()  # ATR 动态窗口得分因子
+    factor = strategy.factor_rsrs(window=16)  # 标准 RSRS 因子
+    # factor = strategy.factor_rsrs_advanced(window=16, z_window=300)  # 研报优选的 RSRS 右偏标准分因子
+
     # 3. 生成目标权重 
     weights_atr = strategy.generate_target_weights(
-        factor_atr, 
+        factor, 
         top_n=1,  
         # enable_absolute_momentum=True, 
-        # absolute_threshold=0         
+        # absolute_threshold=0,
+        # filter_mask=strategy.filter_recent_drop(0.05),        
     )
     
     pf_atr = strategy.run_backtest(weights_atr, init_cash=100000, fees=0.00006)
@@ -274,15 +438,15 @@ if __name__ == "__main__":
     strategy_returns, benchmark_returns = strategy_returns.align(benchmark_returns, join='inner')
     qs.reports.metrics(strategy_returns, benchmark=benchmark_returns, mode='basic')
 
-    # report_name = f"VectorBT_ATR_Rotation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-    # script_dir = os.path.dirname(os.path.abspath(__file__))
-    # report_path = os.path.join(script_dir, report_name)
-    # qs.reports.html(
-    #     returns=strategy_returns, 
-    #     benchmark=benchmark_returns, 
-    #     title=REPORT_TITLE, 
-    #     output=report_path
-    # )
-    # print(f"✅ 报告已生成并保存至: {report_path}")
+    report_name = f"{REPORT_TITLE}_{datetime.now().strftime('%Y%m%d_%H%M')}.html"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    report_path = os.path.join(script_dir, report_name)
+    qs.reports.html(
+        returns=strategy_returns, 
+        benchmark=benchmark_returns, 
+        title=REPORT_TITLE, 
+        output=report_path
+    )
+    print(f"✅ 报告已生成并保存至: {report_path}")
 
     # pf_atr.plot().show()
