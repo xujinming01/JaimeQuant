@@ -73,7 +73,6 @@ class VectorbtRotationStrategy:
         self.lows = pd.concat(df_low_list, axis=1).sort_index().ffill()
         print(f"✅ 数据加载完成，形状: {self.prices.shape}")
 
-
     # ==================== 因子库 ====================
     
     def factor_pure_momentum(self, window=20):
@@ -147,6 +146,45 @@ class VectorbtRotationStrategy:
             
         return factor_df
 
+    def factor_trend_score(self, window=25):
+        """
+        中阶因子：基于线性回归斜率和决定系数 R2 的趋势得分
+        得分 = 归一化后收盘价的斜率 * R2
+        """
+        print(f"🧮 计算因子: {window}日线性回归趋势得分 (Slope * R2)...")
+        
+        # 仅针对风险资产计算因子
+        risk_prices = self.prices[self.code_list]
+        
+        # 1. 构造全局递增的时间序列索引作为 X 轴
+        # 只要保证 X 是等差数列，其与 Y 的协方差/相关系数的计算性质与 [1,2,..,N] 完全一致
+        idx = pd.Series(np.arange(len(risk_prices)), index=risk_prices.index)
+        
+        # 2. 计算滚动协方差和相关系数 (Pandas C 引擎底层运算，极快)
+        # rolling().cov() 和 corr() 会自动与传入的 Series 对齐并进行广播计算
+        rolling_cov = risk_prices.rolling(window).cov(idx)
+        rolling_corr = risk_prices.rolling(window).corr(idx)
+        
+        # 3. 计算 X 的样本方差 (ddof=1)
+        # 固定长度为 window 的等差数列 [1,2,..,N] 的样本方差公式为恒定常数：
+        var_x = window * (window + 1) / 12  
+        
+        # 4. 计算原始斜率和 R2
+        slope_raw = rolling_cov / var_x
+        r_squared = rolling_corr ** 2
+        
+        # 5. 数学等价转换：
+        # 获取每个窗口的起始价格 P0 (即向前 shift window - 1 天)
+        p0 = risk_prices.shift(window - 1) 
+        
+        # 归一化后的斜率 = 原始斜率 / P0
+        slope_norm = slope_raw / p0
+        
+        # 6. 计算最终得分 (避免除以 0 产生的无穷大)
+        factor_df = (slope_norm * r_squared).replace([np.inf, -np.inf], np.nan)
+        
+        return factor_df
+
     def factor_rsrs(self, window=18):
         """
         标准 RSRS 因子 (Resistance Support Relative Strength)
@@ -192,8 +230,7 @@ class VectorbtRotationStrategy:
         r_squared = (cov_xy ** 2) / (var_x * var_y)
         
         # 3. 计算增强版得分 (Slope * R^2)
-        # 乘以 10000 是为了与你注释中的量纲保持一致，也可去掉
-        rsrs_score = 10000 * slope * r_squared
+        rsrs_score = slope * r_squared
         
         return rsrs_score
     
@@ -298,6 +335,29 @@ class VectorbtRotationStrategy:
         
         # 返回安全白名单 (取反)
         return ~is_danger
+
+    def filter_rsrs_timing(self, window=16, z_window=300, threshold=-0.7):
+        """
+        ✨ 新增插件：RSRS 右偏标准分择时风控
+        当某资产的 RSRS 分数跌破 threshold（通常为-0.7左右），视为趋势破位，取消其配置资格。
+        """
+        print(f"🛡️ 计算过滤器: RSRS 高级右偏标准分 (阈值: {threshold})")
+        # 调用内部方法计算 RSRS 矩阵
+        rsrs_matrix = self.factor_rsrs_advanced(window=window, z_window=z_window)
+        
+        # 产生布尔掩码：大于阈值才是 True (安全)，小于等于阈值为 False (危险)
+        # 研报标准：大于0.7强烈看多，小于-0.7强烈看空。这里我们把 -0.7 作为清仓离场线
+        is_safe_mask = rsrs_matrix >= threshold
+        
+        return is_safe_mask
+    
+    def filter_absolute_momentum(self, factor_df, threshold=0.0):
+        """
+        插件：绝对动量过滤
+        当因子的得分低于 threshold 时，视为绝对动量不足，取消其配置资格。
+        """
+        print(f"🛡️ 计算过滤器: 绝对动量过滤 (得分阈值: {threshold})")
+        return factor_df > threshold
     
     # ==================== 信号与执行 ====================
 
@@ -332,20 +392,11 @@ class VectorbtRotationStrategy:
         risk_weights[mask_top] = 1.0 / top_n
         
         final_risk_weights = risk_weights.copy()
-        
-        # 3. 纵向过滤（绝对动量逻辑）
-        if enable_absolute_momentum:
-            print(f"🔒 绝对动量已开启 (阈值: {absolute_threshold})")
-            # 得分必须大于阈值，否则没收权重变回 0.0
-            pass_filter = factor_df > absolute_threshold
-            final_risk_weights = risk_weights[pass_filter].fillna(0.0)
-        else:
-            print("🔓 绝对动量已关闭，仅使用相对排名分配权重")
-            
-        # 4. 计算剩余未分配的权重 (被没收的，或原来就不足的)
+                    
+        # 3. 计算剩余未分配的权重 (被没收的，或原来就不足的)
         remaining_weights = (1.0 - final_risk_weights.sum(axis=1)).round(4)
         
-        # 5. 拼合最终的权重矩阵 (确保包含底仓价格矩阵中的所有列，包括避险资产)
+        # 4. 拼合最终的权重矩阵 (确保包含底仓价格矩阵中的所有列，包括避险资产)
         target_weights = pd.DataFrame(0.0, index=factor_df.index, columns=self.prices.columns)
         
         # 赋予风险资产权重
@@ -362,6 +413,8 @@ class VectorbtRotationStrategy:
     def run_backtest(self, target_weights, init_cash=100000, fees=0.0001):
         """核心回测引擎"""
         print(f"🚀 开始撮合回测 (初始资金: {init_cash}, 费率: {fees})...")
+
+        # exec_weights = target_weights.shift(1).fillna(0.0)  # T-1 生成信号，T 日执行
         
         pf = vbt.Portfolio.from_orders(
             close=self.prices,
@@ -388,16 +441,21 @@ if __name__ == "__main__":
     ETF_DICT = {
         # '510300': '沪深300ETF华泰柏瑞',
         # '510500': '中证500ETF',
-        '510880': '红利ETF华泰柏瑞',
-        '159915': '创业板ETF易方达',
+        # '510880': '红利ETF华泰柏瑞',
+        # '159915': '创业板ETF易方达',
         '513100': '纳指ETF',
         '518880': '黄金ETF华安',
+        '588000': '科创50ETF',
+        '159949': '创业板50ETF华安',
+        '563300': '中证2000ETF华泰柏瑞',
+        '512890': '红利低波ETF华泰柏瑞',
+        '159985': '豆粕ETF',
     }
     BENCHMARK_CODE = '513100'
     
     # 单独拿出来定义，不混杂在 ETF_DICT 中
     SAFE_ASSET_CODE = '161119' # 可以设为 None 来全局只空仓
-    REPORT_TITLE = "ETF RSRS Rotation Basic"
+    REPORT_TITLE = "ETF Rotation 5Y Drop 0.05"
     
     # 2. 实例化策略框架
     strategy = VectorbtRotationStrategy(
@@ -405,31 +463,37 @@ if __name__ == "__main__":
         code_dict=ETF_DICT,
         safe_asset_code=SAFE_ASSET_CODE, # 👈 在初始化框架时，以专用通道传入避险资产
         benchmark_code=BENCHMARK_CODE,
-        start_date='20160101',
+        # start_date='20160101',  # 10年数据，覆盖多个牛熊周期
+        # end_date='20260101',
+        start_date='20190101',  # 5年数据，覆盖最近的牛熊周期
         end_date='20260101',
+        # start_date='20230301',  # 3年数据，部分ETF上市较晚
+        # end_date='20260301',
     )
     
-    # factor = strategy.factor_pure_momentum(window=20)  # 纯动量因子
+    factor = strategy.factor_pure_momentum(window=20)  # 纯动量因子
     # factor = strategy.factor_atr_dynamic_score()  # ATR 动态窗口得分因子
-    factor = strategy.factor_rsrs(window=16)  # 标准 RSRS 因子
-    # factor = strategy.factor_rsrs_advanced(window=16, z_window=300)  # 研报优选的 RSRS 右偏标准分因子
+    # factor = strategy.factor_trend_score(window=20)  # 线性回归趋势得分因子
+
+    # rsrs_safe_mask = strategy.filter_rsrs_timing(window=16, z_window=300, threshold=-0.7)
+    drop_safe_mask = strategy.filter_recent_drop(0.05)
+    # abs_mom_safe_mask = strategy.filter_absolute_momentum(factor, threshold=0.0)
+    # combined_mask = rsrs_safe_mask & drop_safe_mask
 
     # 3. 生成目标权重 
     weights_atr = strategy.generate_target_weights(
         factor, 
         top_n=1,  
-        # enable_absolute_momentum=True, 
-        # absolute_threshold=0,
-        # filter_mask=strategy.filter_recent_drop(0.05),        
+        filter_mask=drop_safe_mask,        
     )
     
     pf_atr = strategy.run_backtest(weights_atr, init_cash=100000, fees=0.00006)
 
-    # 4. 输出与可视化
-    print("\n" + "="*40)
-    print("📈 回测基础统计指标")
-    print("="*40)
-    print(pf_atr.stats())
+    # # 4. 输出与可视化
+    # print("\n" + "="*40)
+    # print("📈 回测基础统计指标")
+    # print("="*40)
+    # print(pf_atr.stats())
     
     # 5. 结合 QuantStats 输出报告
     print("\n📝 正在生成 QuantStats HTML 报告...")

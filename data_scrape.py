@@ -91,7 +91,7 @@ class AkshareDbBase:
                 # 追加进数据库
                 df.to_sql(name=code, con=self.conn, if_exists='append', index=False)
                 print(f'[{name} - {code}] 成功入库 {len(df)} 条数据。\n')
-                time.sleep(3)
+                time.sleep(1)  # 避免请求过快触发反爬机制
                 
             except Exception as e:
                 print(f'[{name} - {code}] ⚠️ 下载或保存失败: {e}\n')
@@ -165,12 +165,17 @@ if __name__ == "__main__":
     
     # 1. 定义需要抓取的字典
     etf_dict = {
-        '510300': '沪深300ETF华泰柏瑞',
-        '510500': '中证500ETF',
-        '510880': '红利ETF华泰柏瑞',
-        '159915': '创业板ETF易方达',
         '513100': '纳指ETF',
         '518880': '黄金ETF华安',
+        # '510300': '沪深300ETF华泰柏瑞',
+        # '510500': '中证500ETF',
+        # '510880': '红利ETF华泰柏瑞',
+        '159915': '创业板ETF易方达',
+        '159949': '创业板50ETF华安',
+        '588000': '科创50ETF',
+        '512890': '红利低波ETF华泰柏瑞',
+        '563300': '中证2000ETF华泰柏瑞',
+        '159985': '豆粕ETF',
     }
 
     lof_dict = {
