@@ -1,10 +1,13 @@
 import unicodedata
-
 import akshare as ak
-import pandas as pd
 import numpy as np
+import pandas as pd
 from datetime import datetime, timedelta
 import warnings
+
+import factors
+import filters
+
 warnings.filterwarnings("ignore")
 
 # ---------------- 代理配置区域 ----------------
@@ -22,7 +25,6 @@ akshare_proxy_patch.install_patch(
     ],
 )
 # ----------------------------------------------
-
 
 def get_visual_width(text):
     """
@@ -103,65 +105,7 @@ def get_realtime_daily_k(symbol, lookback_days=400):
     daily_df = daily_df.sort_index()
     return daily_df.tail(lookback_days)
 
-class LiveSignalGenerator:
-    """实盘信号生成器：接收行情字典并运算策略因子"""
-    def __init__(self, prices, highs, lows, code_list):
-        self.prices = prices
-        self.highs = highs
-        self.lows = lows
-        self.code_list = code_list
-
-    # -------------------------------------------------------------------
-    # 你可以直接把你回测脚本里的因子函数原封不动复制到这里！
-    # 下面以纯动量为例：
-    # -------------------------------------------------------------------
-    def factor_pure_momentum(self, window=20):
-        risk_prices = self.prices[self.code_list]
-        factor_df = risk_prices / risk_prices.shift(window) - 1.0
-        return factor_df
-
-    def filter_recent_drop(self, max_drop_pct=0.05):
-        """
-        插件：过滤近期出现大幅下跌或连续下跌的ETF
-        参数:
-            - max_drop_pct: float, 最大允许下跌幅度（例如 0.05 代表 5%）
-        返回: pd.DataFrame (bool)。True表示安全(可交易)，False表示危险(需过滤)
-        """
-        # 将跌幅百分比转换为价格比率阈值
-        # 例如 0.05 转换为 0.95
-        drop_threshold = 1.0 - max_drop_pct
-        
-        print(f"🛡️ 计算过滤器: 近期下跌过滤 (最大允许跌幅: {max_drop_pct*100}%)")
-        
-        # 仅针对风险资产计算
-        prices = self.prices[self.code_list]
-        
-        # 计算单日涨跌幅
-        daily_ret = prices / prices.shift(1)
-        
-        # 条件1：近3天内有任意一天跌幅超过 max_drop_pct
-        is_large_drop = daily_ret < drop_threshold
-        con1 = is_large_drop.rolling(window=3).max().fillna(0).astype(bool)
-        
-        # 条件2：连续3天连跌，且3天累计跌幅超过 max_drop_pct
-        is_down = prices < prices.shift(1)
-        three_down = is_down & is_down.shift(1) & is_down.shift(2)
-        three_day_drop = (prices / prices.shift(3)) < drop_threshold
-        con2 = three_down & three_day_drop
-        
-        # 条件3：昨天触发了条件2 (连续3天连跌且累计跌幅过大)
-        con3 = con2.shift(1).fillna(False)
-        
-        # 综合危险信号：满足以上任意一个，即视为危险 (True)
-        is_danger = con1 | con2 | con3
-        
-        # 返回安全白名单 (取反)
-        return ~is_danger
-
-
 if __name__ == "__main__":
-    
-    # 你的风险资产池
     ETF_DICT = {
         # '510880': '红利ETF华泰柏瑞',
         # '159915': '创业板ETF易方达',
@@ -194,14 +138,16 @@ if __name__ == "__main__":
     highs = pd.concat(high_list, axis=1).ffill()
     lows = pd.concat(low_list, axis=1).ffill()
     
-    # -------------------------------------------------
-    # 实例化生成器并计算因子
-    # -------------------------------------------------
-    strategy = LiveSignalGenerator(prices, highs, lows, code_list)
+    # ============== 模块化调用 ==============
     print(f"🧮 正在计算策略得分...")
     
-    factor = strategy.factor_pure_momentum(window=20) 
-    # drop_safe_mask = strategy.filter_recent_drop(0.05)
+    # 1. 直接传入 DataFrame 给外部独立模块计算
+    factor = factors.calc_pure_momentum(prices, window=20) 
+    
+    # 2. 调用过滤器 (如果有被过滤掉的，可以直接把分设为极小值或 NaN)
+    drop_safe_mask = filters.filter_recent_drop(prices, 0.05)
+    factor = factor.where(drop_safe_mask, np.nan) 
+    # ============== 模块化调用结束 ==============
     
     # 获取今天（DataFrame 最后一行）的各 ETF 得分
     today_scores = factor.iloc[-1]
@@ -223,7 +169,6 @@ if __name__ == "__main__":
     best_code = ranked.index[0]
     best_score = ranked.iloc[0]
     
-    # 绝对动量/绝对得分 校验
     if best_score > 0:
         print(f"🎯 实盘建议操作: \n👉 满仓持有 / 买入 【{ETF_DICT[best_code]} ({best_code})】")
     else:
