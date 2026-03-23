@@ -195,31 +195,57 @@ if __name__ == "__main__":
     best_code = ranked.index[0]
     best_score = ranked.iloc[0]
     
-    # if best_score > 0:
-    #     print(f"🎯 实盘建议操作: \n👉 满仓持有 / 买入 【{ETF_DICT[best_code]} ({best_code})】")
-    # else:
-    #     print(f"⚠️ 预警: 所有标的动量均为负数！\n👉 实盘建议操作: 空仓，或买入避险资产 (如 161119 货币/债券)")
-    # print("="*45)
-
-    # 微信推送内容文本（使用 HTML 的 <br> 换行）
-    push_content = f"<b>📈 今日 ({prices.index[-1].strftime('%Y-%m-%d')}) 最终信号排名:</b><br><br>"
+    # 准备推送的内容文本（使用 HTML 表格和内联样式排版）
+    # 在国内股市习惯中，红色代表上涨/正收益，绿色代表下跌/负收益
+    push_content = f"""
+    <h3 style="color: #333; margin-bottom: 10px;">📊 今日 ({prices.index[-1].strftime('%Y-%m-%d')}) 信号排名</h3>
+    <table border="0" cellpadding="4" cellspacing="0" style="width: 100%; font-family: sans-serif; font-size: 14px; border-collapse: collapse;">
+        <tr style="border-bottom: 2px solid #ccc; text-align: left; color: #666;">
+            <th style="padding-bottom: 8px;">ETF名称</th>
+            <th style="padding-bottom: 8px;">代码</th>
+            <th style="text-align: right; padding-bottom: 8px;">动量得分</th>
+        </tr>
+    """
     
     for code, score in ranked.items():
         name_str = ETF_DICT[code]
-        push_content += f"{name_str} ({code}): {score*100:.2f}%<br>"
+        # 设置红涨绿跌颜色与带符号的格式化
+        if score > 0:
+            color = "#E60012" # 经典中国红
+            score_str = f"+{score*100:.2f}%"
+        elif score < 0:
+            color = "#009944" # 经典护眼绿
+            score_str = f"{score*100:.2f}%"
+        else:
+            color = "#333333" # 黑色平盘
+            score_str = "0.00%"
+            
+        push_content += f"""
+        <tr style="border-bottom: 1px solid #eee;">
+            <td style="padding: 8px 0;">{name_str}</td>
+            <td style="color: #888; padding: 8px 0;">{code}</td>
+            <td style="text-align: right; color: {color}; font-weight: bold; padding: 8px 0;">{score_str}</td>
+        </tr>
+        """
+        
+    push_content += "</table>"
     
-    push_content += "<br><b>🎯 实盘建议操作:</b><br>"
+    # 结论部分
+    push_content += """
+    <div style="margin-top: 15px; padding: 10px; background-color: #f8f9fa; border-radius: 5px; border-left: 4px solid #0056b3;">
+        <h4 style="margin: 0 0 8px 0; color: #0056b3;">🎯 实盘建议操作</h4>
+    """
     
     if best_score > 0:
-        action_msg = f"👉 满仓持有 / 买入 【{ETF_DICT[best_code]} ({best_code})】"
-        push_content += action_msg
+        push_content += f"<p style='margin: 0; font-size: 15px;'>👉 满仓持有 / 买入 <br><strong style='color: #E60012; font-size: 18px;'>【{ETF_DICT[best_code]} ({best_code})】</strong></p></div>"
         push_title = f"量化调仓：买入 {ETF_DICT[best_code]}"
     else:
-        action_msg = "⚠️ 预警: 所有标的动量均为负数！<br>👉 实盘建议操作: 空仓，或买入避险资产 (如 161119 货币/债券)"
-        push_content += action_msg
+        push_content += "<p style='margin: 0; font-size: 14px; color: #E60012;'>⚠️ <strong>预警: 所有标的动量均为负数！</strong></p>"
+        push_content += "<p style='margin: 5px 0 0 0; font-size: 15px;'>👉 <strong style='color: #009944;'>建议操作: 空仓，或买入避险资产 (如 161119)</strong></p></div>"
         push_title = "量化调仓：动量预警，建议空仓"
         
-    print(push_content.replace("<br>", "\n").replace("<b>", "").replace("</b>", "")) # 终端依然保留文字输出
+    # 终端依然保留纯文本输出（过滤掉 HTML 标签方便命令行查看）
+    print(f"🎯 实盘建议操作: \n👉 {push_title.split('：')[1]}")
     
     # 触发微信推送
     send_wechat_push(push_title, push_content)
