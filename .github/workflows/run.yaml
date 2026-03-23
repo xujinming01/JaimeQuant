@@ -32,4 +32,4 @@ jobs:
       env:
         PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
       run: |
-        python "live_trading_push.py"
+        python "ETF/live_trading_push.py"
