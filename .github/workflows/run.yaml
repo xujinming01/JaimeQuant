@@ -25,7 +25,7 @@ jobs:
       # 这里把需要的库装上。如果你的 factors.py 或 filters.py 用到了 scipy 或 ta 等，也要在这里加进去
       run: |
         python -m pip install --upgrade pip
-        pip install akshare pandas numpy requests scipy
+        pip install akshare pandas numpy requests scipy akshare-proxy-patch
 
     - name: Run trading script
       working-directory: ./ETF
