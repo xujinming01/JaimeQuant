@@ -26,6 +26,25 @@ akshare_proxy_patch.install_patch(
 )
 # ----------------------------------------------
 
+# ----------------- 实盘推送配置区域 -----------------
+ETF_DICT = {
+    # '510880': '红利ETF华泰柏瑞',
+    # '159915': '创业板ETF易方达',
+    '513100': '纳指ETF',
+    '518880': '黄金ETF华安',
+    '512890': '红利低波ETF华泰柏瑞',
+    '588000': '科创50ETF',
+    '159949': '创业板50ETF华安',
+    '512100': '中证1000ETF南方',
+    '563300': '中证2000ETF华泰柏瑞',
+    '159985': '豆粕ETF',
+}
+MOMENTUM_WINDOW = 20
+
+# 如果用到 RSRS 高级版(z_window=300)，这里要设为 400 确保数据长度足够
+LOOKBACK_DAYS = MOMENTUM_WINDOW + 10
+# ----------------------------------------------
+
 def get_visual_width(text):
     """
     计算单个字符串的视觉宽度。
@@ -105,24 +124,7 @@ def get_realtime_daily_k(symbol, lookback_days=400):
     daily_df = daily_df.sort_index()
     return daily_df.tail(lookback_days)
 
-if __name__ == "__main__":
-    ETF_DICT = {
-        # '510880': '红利ETF华泰柏瑞',
-        # '159915': '创业板ETF易方达',
-        '513100': '纳指ETF',
-        '518880': '黄金ETF华安',
-        '512890': '红利低波ETF华泰柏瑞',
-        '588000': '科创50ETF',
-        '159949': '创业板50ETF华安',
-        '512100': '中证1000ETF南方',
-        '563300': '中证2000ETF华泰柏瑞',
-        '159985': '豆粕ETF',
-    }
-    
-    code_list = list(ETF_DICT.keys())
-    
-    # 如果你用到 RSRS 高级版(z_window=300)，这里请设为 400 确保数据长度足够
-    LOOKBACK_DAYS = 30 
+def main():
     
     print(f"🕒 正在实时抓取数据并合成今日(截至14:50) 的 K 线特征...")
     
@@ -143,7 +145,7 @@ if __name__ == "__main__":
     print(f"🧮 正在计算策略得分...")
     
     # 1. 直接传入 DataFrame 给外部独立模块计算
-    factor = factors.calc_pure_momentum(prices, window=20) 
+    factor = factors.calc_pure_momentum(prices, window=MOMENTUM_WINDOW) 
     
     # # 2. 调用过滤器 (如果有被过滤掉的，可以直接把分设为极小值或 NaN)
     # drop_safe_mask = filters.filter_recent_drop(prices, 0.05)
@@ -169,9 +171,14 @@ if __name__ == "__main__":
     # 提取第一名
     best_code = ranked.index[0]
     best_score = ranked.iloc[0]
-    
+
     if best_score > 0:
         print(f"🎯 实盘建议操作: \n👉 满仓持有 / 买入 【{ETF_DICT[best_code]} ({best_code})】")
     else:
         print(f"⚠️ 预警: 所有标的动量均为负数！\n👉 实盘建议操作: 空仓，或买入避险资产 (如 161119 货币/债券)")
     print("="*45)
+
+    return prices, ranked, best_code, best_score
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,49 @@
+name: Auto Scrape and Update Database
+
+on:
+  # 1. 定时触发 (每个月 1 号的 UTC 时间 09:30 运行，即北京时间 17:30)
+  schedule:
+    - cron: '30 9 1 * *' 
+  # 2. 允许手动点击按钮触发，方便随时测试补数据
+  workflow_dispatch:
+
+# 赋予 Actions 读写仓库的权限（必须，否则无法 commit）
+permissions:
+  contents: write
+
+jobs:
+  scrape-and-update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13' 
+          cache: 'pip'           
+
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run data_scrape.py
+        # 【重要添加】强制设置时区为上海，保证脚本里的 datetime.now() 是北京时间
+        env:
+          TZ: Asia/Shanghai 
+        run: python data_scrape.py
+
+      - name: Commit and push changes
+        run: |
+          # 配置 git 机器人身份
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # 添加 database 文件夹下的修改
+          git add database/
+          
+          # 检查是否有文件改动，如果有则 commit 并 push
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update database [skip ci]" && git push)
