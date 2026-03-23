@@ -1,0 +1,35 @@
+name: Daily Quant Trading Run
+
+on:
+  schedule:
+    # GitHub 运行在 UTC 时间。北京时间 = UTC + 8
+    # 北京时间 14:45 对应 UTC 时间的 06:45
+    # GitHub 定时任务由于资源排队，通常会延迟 2~5 分钟，所以设置为 45 分触发比较稳妥
+    - cron: '45 6 * * 1-5' # 1-5 代表周一到周五
+  workflow_dispatch: # 加上这个允许你在 GitHub 网页端手动点击运行，方便测试代码
+
+jobs:
+  run-strategy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.13' # 可根据你本地实际的 Python 版本修改
+
+    - name: Install dependencies
+      # 这里把需要的库装上。如果你的 factors.py 或 filters.py 用到了 scipy 或 ta 等，也要在这里加进去
+      run: |
+        python -m pip install --upgrade pip
+        pip install akshare pandas numpy requests
+
+    - name: Run trading script
+      # 从 GitHub Secrets 中读取 Token 注入为环境变量
+      env:
+        PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      run: |
+        python "live_trading_push.py"
