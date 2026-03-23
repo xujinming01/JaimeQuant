@@ -160,7 +160,7 @@ class BondIndexHist(AkshareDbBase):
 # ================= 运行入口 =================
 if __name__ == "__main__":
     # 确保目录存在
-    db_path = 'JaimeQuant/database/'
+    db_path = 'database/'
     os.makedirs(db_path, exist_ok=True)
     
     # 1. 定义需要抓取的字典
