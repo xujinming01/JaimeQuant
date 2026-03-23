@@ -242,27 +242,28 @@ def generate_donchian_rotation_weights(strategy, window=20):
 
 def main():
     # 数据库路径（相对 __file__ 的位置）
-    DB_PATH = 'JaimeQuant/database/dayK.db'
+    DB_PATH = 'database/dayK.db'
 
     # 风险资产字典：仅包含用于因子横向排名的标的（不含避险资产）
     ETF_DICT = {
         # '510300': '沪深300ETF华泰柏瑞',
         # '510500': '中证500ETF',
-        '510880': '红利ETF华泰柏瑞',
-        '159915': '创业板ETF易方达',
+        # '510880': '红利ETF华泰柏瑞',
+        # '159915': '创业板ETF易方达',
         '513100': '纳指ETF',
         '518880': '黄金ETF华安',
-        # '588000': '科创50ETF',
-        # '159949': '创业板50ETF华安',
-        # '563300': '中证2000ETF华泰柏瑞',
-        # '512890': '红利低波ETF华泰柏瑞',
-        # '159985': '豆粕ETF',
+        '588000': '科创50ETF',
+        '159949': '创业板50ETF华安',
+        '512100': '中证1000ETF南方',
+        '563300': '中证2000ETF华泰柏瑞',
+        '512890': '红利低波ETF华泰柏瑞',
+        '159985': '豆粕ETF',
     }
     BENCHMARK_CODE = '513100'
 
     # 避险资产单独定义，不放入 ETF_DICT；可设为 None 表示不配置避险仓
     SAFE_ASSET_CODE = '161119'  # '161119'-易方达新综债LOF，'511880'-银华日利
-    REPORT_TITLE = "ETF Rotation 10Y 120D MA"
+    REPORT_TITLE = "ETF Rotation"
     
     # 2. 实例化策略框架（构建并加载行情数据）
     strategy = VectorbtRotationStrategy(
@@ -270,8 +271,8 @@ def main():
         code_dict=ETF_DICT,
         safe_asset_code=SAFE_ASSET_CODE, # 👈 在初始化框架时，以专用通道传入避险资产
         benchmark_code=BENCHMARK_CODE,
-        start_date='20160101',  # 10年数据，覆盖多个牛熊周期
-        end_date='20260101',
+        # start_date='20160101',  # 10年数据，覆盖多个牛熊周期
+        # end_date='20260101',
         # start_date='20190101',  # 5年数据，覆盖最近的牛熊周期
         # end_date='20260101',
         # start_date='20230301',  # 3年数据，部分ETF上市较晚
@@ -300,7 +301,7 @@ def main():
     # 3. 根据因子与过滤器生成每日目标权重
     weights = strategy.generate_target_weights(
         factor,
-        top_n=2,
+        top_n=1,
         # pre_filter_mask=abs_mom_mask,
         # post_filter_mask=abs_mom_mask,       
     )

@@ -1,6 +1,5 @@
 import os
 import time
-import sqlite3
 import pandas as pd
 import akshare as ak
 from datetime import datetime, timedelta
@@ -21,35 +20,33 @@ akshare_proxy_patch.install_patch(
 )
 # ----------------------------------------------
 
-class AkshareDbBase:
+class AkshareCsvBase:
     """
-    通用数据爬取与入库基类
-    封装了SQLite连接、增量日期计算、通用入库逻辑
+    通用数据爬取与入库基类 (CSV 版本)
+    封装了CSV读写、增量日期计算逻辑
     """
-    def __init__(self, db_path):
-        self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path)
+    def __init__(self, csv_dir):
+        self.csv_dir = csv_dir
+        os.makedirs(self.csv_dir, exist_ok=True)
         
     def _get_start_date(self, code, default_start):
-        """获取本地数据库中该代码的最新日期，计算增量拉取的起始日"""
-        try:
-            query = f'SELECT MAX(日期) FROM "{code}"'
-            max_date_val = pd.read_sql(query, self.conn).iloc[0, 0]
-            
-            if pd.notna(max_date_val):
-                if isinstance(max_date_val, str):
-                    last_date = datetime.strptime(max_date_val[:10], '%Y-%m-%d')
-                else:
-                    last_date = max_date_val
-                    
-                start_date = (last_date + timedelta(days=1)).strftime('%Y%m%d')
-                return start_date, last_date
-            
-        except (sqlite3.OperationalError, pd.errors.DatabaseError) as e:
-            if "no such table" not in str(e).lower():
-                print(f'[{code}] ⚠️ 数据库查询异常: {e}')
+        """获取本地CSV中该代码的最新日期，计算增量拉取的起始日"""
+        csv_path = os.path.join(self.csv_dir, f"{code}.csv")
         
-        # 默认情况（表不存在或为空）
+        if os.path.exists(csv_path):
+            try:
+                # 只读取'日期'这一列来寻找最大值，节省内存和时间
+                df_dates = pd.read_csv(csv_path, usecols=['日期'])
+                max_date_val = df_dates['日期'].max()
+                
+                if pd.notna(max_date_val):
+                    last_date = pd.to_datetime(max_date_val)
+                    start_date = (last_date + timedelta(days=1)).strftime('%Y%m%d')
+                    return start_date, last_date
+            except Exception as e:
+                print(f'[{code}] ⚠️ CSV查询异常或文件损坏: {e}')
+        
+        # 默认情况（文件不存在或读取失败）
         return default_start, None
 
     def _fetch_api_data(self, code, start_date, end_date):
@@ -60,7 +57,7 @@ class AkshareDbBase:
 
     def fetch_and_save(self, code_dict, default_start='19901219'):
         """
-        核心调度流程：遍历字典 -> 检查本地日期 -> 调用API拉取 -> 格式化存入DB
+        核心调度流程：遍历字典 -> 检查本地日期 -> 调用API拉取 -> 追加存入CSV
         """
         end_date = datetime.now().strftime('%Y%m%d')
         
@@ -84,12 +81,17 @@ class AkshareDbBase:
                     print(f'[{name} - {code}] 该区间无新数据。\n')
                     continue
                 
-                # 通用数据处理
+                # 通用数据处理：统一日期格式为 YYYY-MM-DD，让CSV更美观且标准
                 if '日期' in df.columns:
-                    df['日期'] = pd.to_datetime(df['日期'])
+                    df['日期'] = pd.to_datetime(df['日期']).dt.strftime('%Y-%m-%d')
                                 
-                # 追加进数据库
-                df.to_sql(name=code, con=self.conn, if_exists='append', index=False)
+                # 追加进 CSV
+                csv_path = os.path.join(self.csv_dir, f"{code}.csv")
+                file_exists = os.path.exists(csv_path)
+                
+                # 如果文件不存在，写入表头(header=True)；存在则不写表头，直接追加(mode='a')
+                df.to_csv(csv_path, mode='a', header=not file_exists, index=False, encoding='utf-8-sig')
+                
                 print(f'[{name} - {code}] 成功入库 {len(df)} 条数据。\n')
                 time.sleep(1)  # 避免请求过快触发反爬机制
                 
@@ -98,16 +100,17 @@ class AkshareDbBase:
 
     def get_raw_df(self, code):
         """读取单只标的完整数据"""
-        query = f'SELECT * FROM "{code}" ORDER BY 日期'
-        return pd.read_sql(query, self.conn)
-
-    def close(self):
-        self.conn.close()
+        csv_path = os.path.join(self.csv_dir, f"{code}.csv")
+        if os.path.exists(csv_path):
+            df = pd.read_csv(csv_path)
+            df['日期'] = pd.to_datetime(df['日期'])
+            return df.sort_values('日期').reset_index(drop=True)
+        return pd.DataFrame()
 
 
 # ================= 具体数据类 (继承基类) =================
 
-class FundEtfHistEm(AkshareDbBase):
+class FundEtfHistEm(AkshareCsvBase):
     """ETF历史行情抓取类"""
     def _fetch_api_data(self, code, start_date, end_date):
         # 针对 ETF 开启复权 (adjust='hfq')
@@ -116,7 +119,7 @@ class FundEtfHistEm(AkshareDbBase):
             start_date=start_date, end_date=end_date, adjust='hfq'
         )
     
-class FundLofHistEm(AkshareDbBase):
+class FundLofHistEm(AkshareCsvBase):
     """LOF历史行情抓取类"""
     def _fetch_api_data(self, code, start_date, end_date):
         # 针对 LOF 开启复权 (adjust='hfq')
@@ -125,7 +128,7 @@ class FundLofHistEm(AkshareDbBase):
             start_date=start_date, end_date=end_date, adjust='hfq'
         )
 
-class IndexZhAHist(AkshareDbBase):
+class IndexZhAHist(AkshareCsvBase):
     """A股指数历史行情抓取类"""
     def _fetch_api_data(self, code, start_date, end_date):
         # 针对 指数 的特定参数调用
@@ -134,7 +137,7 @@ class IndexZhAHist(AkshareDbBase):
             start_date=start_date, end_date=end_date
         )
 
-class BondIndexHist(AkshareDbBase):
+class BondIndexHist(AkshareCsvBase):
     """债券指数历史行情抓取类"""
     def _fetch_api_data(self, code, start_date, end_date):
         # 债券接口不支持增量参数，此处直接拉取全量历史数据
@@ -161,7 +164,6 @@ class BondIndexHist(AkshareDbBase):
 if __name__ == "__main__":
     # 确保目录存在
     db_path = 'database/'
-    os.makedirs(db_path, exist_ok=True)
     
     # 1. 定义需要抓取的字典
     etf_dict = {
@@ -193,32 +195,25 @@ if __name__ == "__main__":
     }
 
     # 2. 实例化对应的类并分配数据库文件
-    # 可以选择存在同一个db文件里，也可以分开存。这里演示分开存。
-    etf_db = FundEtfHistEm(os.path.join(db_path, 'dayK.db'))
-    lof_db = FundLofHistEm(os.path.join(db_path, 'dayK.db'))
-    index_db = IndexZhAHist(os.path.join(db_path, 'dayK.db'))
-    bond_index_db = BondIndexHist(os.path.join(db_path, 'dayK.db'))
+    etf_worker = FundEtfHistEm(db_path)
+    lof_worker = FundLofHistEm(db_path)
+    index_worker = IndexZhAHist(db_path)
+    bond_index_worker = BondIndexHist(db_path)
+    
     # 3. 执行更新操作
     print("====== 开始更新 ETF 数据 ======")
-    etf_db.fetch_and_save(etf_dict, default_start='19901219')
+    etf_worker.fetch_and_save(etf_dict, default_start='19901219')
     
     print("====== 开始更新 LOF 数据 ======")
-    lof_db.fetch_and_save(lof_dict, default_start='19901219')
+    lof_worker.fetch_and_save(lof_dict, default_start='19901219')
     
     print("====== 开始更新 指数 数据 ======")
-    index_db.fetch_and_save(index_dict, default_start='19901219')
-    bond_index_db.fetch_and_save(bond_index_dict, default_start='19901219')
+    index_worker.fetch_and_save(index_dict, default_start='19901219')
+    bond_index_worker.fetch_and_save(bond_index_dict, default_start='19901219')
     
-    # 测试读取
-    print("测试读取 上证50 指数：")
+    print("测试读取 上证50 指数 CSV：")
     try:
-        df_50 = index_db.get_raw_df('000016')
+        df_50 = index_worker.get_raw_df('000016')
         print(df_50.tail())
     except Exception as e:
         print(f"读取测试失败: {e}")
-    
-    # 4. 关闭连接
-    etf_db.close()
-    lof_db.close()
-    index_db.close()
-    bond_index_db.close()
