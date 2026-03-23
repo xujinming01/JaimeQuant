@@ -85,3 +85,30 @@ def filter_absolute_momentum(prices, window: int = 120, threshold: float = 0.0):
     print(f"🛡️ 计算过滤器: {window}日 绝对动量过滤 (得分阈值: {threshold})")
     momentum = (prices / prices.shift(window)) - 1.0
     return momentum > threshold
+
+
+def filter_moving_average(prices, window: int = 120):
+    """均线过滤器：比较当前价格与过去 `window` 日的简单移动平均线 (SMA)。
+
+    规则：
+    - 当前价格必须严格大于其 `window` 日均线，才算通过过滤。
+    - 用于判断资产是否处于中长期多头趋势，防止在长周期熊市或深调中接飞刀。
+
+    参数
+    - prices: pandas.Series 或 pandas.DataFrame，按时间索引的价格序列。
+    - window: 计算均线的时间窗口（单位：交易日），例如 120 表示 120 日均线。
+
+    返回
+    - 布尔掩码（同 shape）：True 表示当前价格 > 均线（通过）；False 表示被过滤掉。
+    """
+    print(f"🛡️ 计算过滤器: {window}日 均线过滤 (价格需在均线之上)")
+    
+    # 计算移动平均线 (Simple Moving Average)
+    # min_periods=1 可以让前 window-1 天也有数据（根据已有天数算平均），
+    # 但严格的均线过滤通常要求必须满 window 天才给出信号，因此使用默认的 min_periods=window。
+    ma = prices.rolling(window=window).mean()
+    
+    # 判断当前价格是否大于均线 (含有 NaN 的部分进行比较时会自动返回 False)
+    is_above_ma = prices > ma
+    
+    return is_above_ma

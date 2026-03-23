@@ -114,8 +114,9 @@ if __name__ == "__main__":
         '512890': '红利低波ETF华泰柏瑞',
         '588000': '科创50ETF',
         '159949': '创业板50ETF华安',
+        '512100': '中证1000ETF南方',
         '563300': '中证2000ETF华泰柏瑞',
-        # '159985': '豆粕ETF',
+        '159985': '豆粕ETF',
     }
     
     code_list = list(ETF_DICT.keys())
@@ -144,9 +145,9 @@ if __name__ == "__main__":
     # 1. 直接传入 DataFrame 给外部独立模块计算
     factor = factors.calc_pure_momentum(prices, window=20) 
     
-    # 2. 调用过滤器 (如果有被过滤掉的，可以直接把分设为极小值或 NaN)
-    drop_safe_mask = filters.filter_recent_drop(prices, 0.05)
-    factor = factor.where(drop_safe_mask, np.nan) 
+    # # 2. 调用过滤器 (如果有被过滤掉的，可以直接把分设为极小值或 NaN)
+    # drop_safe_mask = filters.filter_recent_drop(prices, 0.05)
+    # factor = factor.where(drop_safe_mask, np.nan) 
     # ============== 模块化调用结束 ==============
     
     # 获取今天（DataFrame 最后一行）的各 ETF 得分

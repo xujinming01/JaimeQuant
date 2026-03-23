@@ -130,33 +130,117 @@ class VectorbtRotationStrategy:
             print(f"⚠️ 警告: 指定避险资产 '{self.safe_asset_code}' 未加载到行情，退化为持有现金（空仓）。")
 
         return target_weights
-    def run_backtest(self, target_weights, init_cash=100000, fees=0.0001):
+    def run_backtest(self, target_weights, init_cash=100000, fees=0.0001, rebalance_freq='D'):
         """执行回测并返回 vectorbt 的 Portfolio 对象。
 
-        参数说明：`target_weights` 应为目标仓位（target percent），
-        回测以日频执行，支持 `cash_sharing` 和真实手续费设置。
+        参数说明：
+        - target_weights: 每日目标仓位宽表
+        - init_cash: 初始资金
+        - fees: 交易费率
+        - rebalance_freq: 调仓频率，支持 'D', 'W', '2W', 'M', 'Q', 'Y'
         """
-        print(f"🚀 开始撮合回测 (初始资金: {init_cash}, 手续费: {fees})...")
+        print(f"🚀 开始撮合回测 (初始资金: {init_cash}, 手续费: {fees}, 调仓频率: {rebalance_freq})...")
 
-        # 注意：若需要 T-1 信号执行，可将 target_weights.shift(1) 传入
+        # 复制一份权重避免修改原始数据
+        weights = target_weights.copy()
+        
+        if rebalance_freq != 'D':
+            # 提取时间的各个维度特征
+            idx = weights.index
+            years = idx.year
+            months = idx.month
+            quarters = idx.quarter
+            # ISO历法下的年份和周数 (规避跨年周的bug)
+            iso_years = idx.isocalendar().year
+            iso_weeks = idx.isocalendar().week
+            
+            # 根据不同的频率设定分组条件
+            if rebalance_freq == 'Y':      # 年
+                grouper = [years]
+            elif rebalance_freq == 'Q':    # 季
+                grouper = [years, quarters]
+            elif rebalance_freq == 'M':    # 月
+                grouper = [years, months]
+            elif rebalance_freq == 'W':    # 周
+                grouper = [iso_years, iso_weeks]
+            elif rebalance_freq == '2W':   # 双周
+                # 将周数减1后整除2，使得(周1,周2)分在一组，(周3,周4)分在一组
+                grouper = [iso_years, (iso_weeks - 1) // 2]
+            else:
+                raise ValueError(f"❌ 不支持的调仓频率: {rebalance_freq}")
+
+            # 根据确定的周期进行分组，并获取每个周期内的最后一个“有效交易日”
+            rebalance_dates = weights.groupby(grouper).tail(1).index
+            
+            # 将非调仓日的值设为 NaN，vectorbt 会在这些天保持仓位不变
+            weights[~weights.index.isin(rebalance_dates)] = np.nan
+
+        # 执行订单撮合
         pf = vbt.Portfolio.from_orders(
             close=self.prices,
-            size=target_weights,
+            size=weights,
             size_type='targetpercent',
             group_by=True,
             cash_sharing=True,
             init_cash=init_cash,
             fees=fees,
             slippage=0.000,
-            freq='D'
+            freq='D'  # 底层数据永远是日频，不要改这里
         )
         print("✅ 回测完成！")
         return pf
-
-
-# ================= 运行入口与分析 =================
-if __name__ == "__main__":
     
+
+def generate_donchian_rotation_weights(strategy, window=20):
+    """
+    海龟通道 + 动量轮动 状态机生成目标权重
+    """
+    print(f"🐢 正在生成 海龟+动量轮动 目标权重 (窗口: {window}日)...")
+    
+    # 提取风险资产数据
+    risk_codes = strategy.code_list
+    prices = strategy.prices[risk_codes]
+    highs = strategy.highs[risk_codes]
+    lows = strategy.lows[risk_codes]
+    
+    # 1. 计算轮动排序：现价相对于N日前收盘价的涨幅
+    momentum = prices / prices.shift(window) - 1.0
+    
+    # 使用 method='first' 保证每天即使有涨幅相同的，也只选出唯一的一个第一名
+    ranks = momentum.rank(axis=1, ascending=False, method='first')
+    is_rank1 = (ranks == 1) # 布尔型 DataFrame，标记每天的第一名
+    
+    # 2. 计算唐奇安通道（20日最高、最低点），shift(1) 避免未来函数
+    high_20 = highs.shift(1).rolling(window).max()
+    low_20 = lows.shift(1).rolling(window).min()
+    
+    # 3. 构建核心信号矩阵 (布尔型)
+    # 【开仓条件】：必须是当天的第一名，且现价突破前20日最高点
+    entry_signal = is_rank1 & (prices > high_20)
+    
+    # 【平仓条件】：不再是第一名（排名变更），或者 现价跌破前20日最低点
+    exit_signal = (~is_rank1) | (prices < low_20)
+    
+    # 4. 向量化状态机核心：利用 NaN 和 ffill (前向填充) 传播持仓状态
+    signals = pd.DataFrame(np.nan, index=prices.index, columns=prices.columns)
+    
+    # 赋值信号（注：因为平仓包含~is_rank1，开仓包含is_rank1，所以同一天绝对不会发生冲突）
+    signals[entry_signal] = 1.0
+    signals[exit_signal] = 0.0
+    
+    # 向前填充状态（1会一直延续到遇到0），最初始的 NaN 填 0
+    target_weights = signals.ffill().fillna(0.0)
+    
+    # 5. 处理避险资产分配
+    if strategy.safe_asset_code:
+        # 每行风险资产的权重总和 (因为限定了 rank1，最大和永远是 1)
+        risk_exposure = target_weights.sum(axis=1)
+        # 空仓部分自动买入国债/避险资产
+        target_weights[strategy.safe_asset_code] = 1.0 - risk_exposure
+        
+    return target_weights
+
+def main():
     # 数据库路径（相对 __file__ 的位置）
     DB_PATH = 'JaimeQuant/database/dayK.db'
 
@@ -164,21 +248,21 @@ if __name__ == "__main__":
     ETF_DICT = {
         # '510300': '沪深300ETF华泰柏瑞',
         # '510500': '中证500ETF',
-        # '510880': '红利ETF华泰柏瑞',
-        # '159915': '创业板ETF易方达',
+        '510880': '红利ETF华泰柏瑞',
+        '159915': '创业板ETF易方达',
         '513100': '纳指ETF',
         '518880': '黄金ETF华安',
-        '588000': '科创50ETF',
-        '159949': '创业板50ETF华安',
-        '563300': '中证2000ETF华泰柏瑞',
-        '512890': '红利低波ETF华泰柏瑞',
+        # '588000': '科创50ETF',
+        # '159949': '创业板50ETF华安',
+        # '563300': '中证2000ETF华泰柏瑞',
+        # '512890': '红利低波ETF华泰柏瑞',
         # '159985': '豆粕ETF',
     }
     BENCHMARK_CODE = '513100'
 
     # 避险资产单独定义，不放入 ETF_DICT；可设为 None 表示不配置避险仓
-    SAFE_ASSET_CODE = '161119'
-    REPORT_TITLE = "ETF Rotation 10Y"
+    SAFE_ASSET_CODE = '161119'  # '161119'-易方达新综债LOF，'511880'-银华日利
+    REPORT_TITLE = "ETF Rotation 10Y 120D MA"
     
     # 2. 实例化策略框架（构建并加载行情数据）
     strategy = VectorbtRotationStrategy(
@@ -186,12 +270,12 @@ if __name__ == "__main__":
         code_dict=ETF_DICT,
         safe_asset_code=SAFE_ASSET_CODE, # 👈 在初始化框架时，以专用通道传入避险资产
         benchmark_code=BENCHMARK_CODE,
-        # start_date='20160101',  # 10年数据，覆盖多个牛熊周期
-        # end_date='20260101',
+        start_date='20160101',  # 10年数据，覆盖多个牛熊周期
+        end_date='20260101',
         # start_date='20190101',  # 5年数据，覆盖最近的牛熊周期
         # end_date='20260101',
-        start_date='20230301',  # 3年数据，部分ETF上市较晚
-        end_date='20260301',
+        # start_date='20230301',  # 3年数据，部分ETF上市较晚
+        # end_date='20260301',
     )
 
     # 获取风险资产的价格/最高/最低（用于因子与过滤器计算）
@@ -201,35 +285,46 @@ if __name__ == "__main__":
     
     # 因子选择
     factor = factors.calc_pure_momentum(risk_prices, window=20)  # 纯动量因子
+    # factor = factors.calc_moving_average_momentum(risk_prices, window=20)  # 均线动量因子
     # factor = factors.calc_atr_dynamic_score(risk_prices, risk_highs, risk_lows)  # ATR 动态窗口得分因子
+    # factor = factors.calc_beta_atr_dynamic_score(risk_prices, risk_highs, risk_lows)  # Beta-ATR 动态窗口得分因子
     # factor = factors.calc_trend_score(risk_prices, window=20)  # 线性回归趋势得分因子
 
     # 过滤器选择
     # rsrs_safe_mask = filters.filter_rsrs_timing(risk_highs, risk_lows, window=16, z_window=300, threshold=-0.7)
-    drop_safe_mask = filters.filter_recent_drop(risk_prices, 0.05)
-    # abs_mom_120_mask = filters.filter_absolute_momentum(risk_prices, window=120, threshold=0.0)
+    # drop_safe_mask = filters.filter_recent_drop(risk_prices, 0.05)
+    # abs_mom_mask = filters.filter_absolute_momentum(risk_prices, window=20, threshold=0.0)
+    # mov_avg_mask = filters.filter_moving_average(risk_prices, window=120)
     # combined_mask = rsrs_safe_mask & drop_safe_mask
 
     # 3. 根据因子与过滤器生成每日目标权重
-    weights_atr = strategy.generate_target_weights(
+    weights = strategy.generate_target_weights(
         factor,
-        top_n=1,
-        pre_filter_mask=drop_safe_mask,
-        # post_filter_mask=abs_mom_120_mask # 绝对动量可作为后处理，选出来如果动量不足再没收重分        
+        top_n=2,
+        # pre_filter_mask=abs_mom_mask,
+        # post_filter_mask=abs_mom_mask,       
     )
 
+    # weights = generate_donchian_rotation_weights(strategy, window=20)  # 海龟通道 + 动量轮动 状态机生成目标权重
+
     # 运行回测并获取 Portfolio 结果
-    pf_atr = strategy.run_backtest(weights_atr, init_cash=100000, fees=0.00006)
+    # pf = strategy.run_backtest(weights_atr, init_cash=100000, fees=0.00006)
+    pf = strategy.run_backtest(
+        weights,
+        init_cash=100000,
+        fees=0.00006,  # 手续费
+        rebalance_freq='D',  # 'D', 'W', '2W', 'M', 'Q', 'Y', 调仓频率
+    )
 
     # # 4. 打印回测基本统计
     # print("\n" + "=" * 40)
     # print("📈 回测基础统计指标")
     # print("=" * 40)
-    # print(pf_atr.stats())
+    # print(pf.stats())
 
     # 5. 使用 QuantStats 生成 HTML 报告
     print("\n📝 正在生成 QuantStats HTML 报告...")
-    strategy_returns = pf_atr.returns()
+    strategy_returns = pf.returns()
     benchmark_returns = strategy.prices[BENCHMARK_CODE].pct_change().fillna(0)
     strategy_returns, benchmark_returns = strategy_returns.align(benchmark_returns, join='inner')
     qs.reports.metrics(strategy_returns, benchmark=benchmark_returns, mode='basic')
@@ -246,4 +341,10 @@ if __name__ == "__main__":
     # print(f"✅ 报告已生成并保存至: {report_path}")
 
     # 若需要交互式展示，可取消下一行注释
-    # pf_atr.plot().show()
+    # pf.plot().show()
+
+
+# ================= 运行入口与分析 =================
+if __name__ == "__main__":
+    
+    main()

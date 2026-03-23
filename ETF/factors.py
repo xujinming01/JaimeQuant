@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from scipy.stats import beta
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -7,6 +8,18 @@ def calc_pure_momentum(prices, window=20):
     """计算过去 N 天的动量涨幅"""
     print(f"🧮 计算因子: {window}日纯动量...")
     factor_df = prices / prices.shift(window) - 1.0
+    return factor_df
+
+def calc_moving_average_momentum(prices, window=20):
+    """计算现价偏离 N 日均线的幅度（均线平滑动量）"""
+    print(f"🧮 计算因子: {window}日均线平滑动量...")
+    
+    # 1. 计算过去 N 天的简单移动平均线
+    ma_df = prices.rolling(window=window).mean()
+    
+    # 2. 计算当前价格与均线的比值（动量得分）
+    factor_df = prices / ma_df - 1.0
+    
     return factor_df
 
 def calc_atr_dynamic_score(prices, highs, lows, lb_min=20, lb_max=60, vol_short_len=20, vol_long_len=60, ratio_cap=0.9):
@@ -56,6 +69,79 @@ def calc_atr_dynamic_score(prices, highs, lows, lb_min=20, lb_max=60, vol_short_
         
         for i in range(lb_max, len(prices_arr)):
             curr_lb = lookback_arr[i]
+            window_prices = prices_arr[i - curr_lb + 1 : i + 1]
+            scores[i] = fast_score(window_prices)
+            
+        factor_df[code] = scores
+        
+    return factor_df
+
+def calc_beta_atr_dynamic_score(prices, highs, lows, lb_min=10, lb_max=60, atr_window=20, rank_window=252, a=2, b=5):
+    """
+    基于 Beta 分布和波动率分位数的动态非线性窗口回归得分
+    a=2, b=5: 右偏分布，使日常窗口偏向于 lb_max，只有在极端波动时迅速缩短至 lb_min
+    """
+    print(f"🧮 计算因子: 基于 Beta 分布动态窗口回归得分 (a={a}, b={b})...")
+    
+    prev_close = prices.shift(1)
+    
+    # 1. 计算 TR
+    tr1 = highs - lows
+    tr2 = (highs - prev_close).abs()
+    tr3 = (lows - prev_close).abs()
+    
+    tr = pd.DataFrame(
+        np.maximum(tr1.values, np.maximum(tr2.values, tr3.values)),
+        index=prices.index,
+        columns=prices.columns
+    )
+    
+    # 2. 计算平滑后的日常波动率 (ATR)，直接用 TR 太过跳跃
+    atr = tr.rolling(atr_window).mean()
+    
+    # 3. 计算波动率在过去 rank_window(如252天) 的百分位排名 [0, 1]
+    # 【性能优化】：直接使用内置的 rolling().rank()，比 apply(lambda) 提速上百倍
+    vol_rank = atr.rolling(rank_window).rank(pct=True)
+    
+    # 前期数据不足时，假设处于中等偏低的波动状态，防止报错
+    vol_rank_filled = vol_rank.fillna(0.3) 
+    
+    # 4. 生成 Beta CDF 映射
+    # scipy.stats.beta.cdf 支持直接传入 numpy array
+    beta_val = pd.DataFrame(
+        beta.cdf(vol_rank_filled.values, a, b),
+        index=prices.index,
+        columns=prices.columns
+    )
+    
+    # 5. 反向映射到具体天数：波动率越大(beta_val接近1)，窗口越小(接近lb_min)
+    dynamic_window = lb_max - beta_val * (lb_max - lb_min)
+    
+    # 取整并确保在合法范围内
+    lookback_df = np.floor(dynamic_window).astype(int).clip(lower=lb_min, upper=lb_max)
+    
+    # 6. 计算动态窗口的线性回归得分 (沿用高效的 numpy loop 计算)
+    factor_df = pd.DataFrame(np.nan, index=prices.index, columns=prices.columns)
+    
+    def fast_score(y):
+        if len(y) < 2 or y[0] == 0: return np.nan
+        y_norm = y / y[0]
+        x = np.arange(1, len(y) + 1)
+        cov = np.cov(x, y_norm, ddof=0)[0, 1]
+        var_x = np.var(x, ddof=0)
+        if var_x == 0: return np.nan
+        slope = cov / var_x
+        r_squared = np.corrcoef(x, y_norm)[0, 1] ** 2
+        return slope * r_squared
+        
+    for code in prices.columns:
+        prices_arr = prices[code].values
+        lookback_arr = lookback_df[code].values
+        scores = np.full(len(prices_arr), np.nan)
+        
+        for i in range(lb_max, len(prices_arr)):
+            curr_lb = lookback_arr[i]
+            # 根据动态窗口截取价格序列
             window_prices = prices_arr[i - curr_lb + 1 : i + 1]
             scores[i] = fast_score(window_prices)
             
