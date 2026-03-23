@@ -1,4 +1,5 @@
 akshare==1.18.22
+akshare-proxy-patch==0.2.13
 matplotlib==3.10.6
 numpy==2.3.2
 pandas==2.3.2
