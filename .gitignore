@@ -208,5 +208,6 @@ __marimo__/
 
 
 *.db
-*.html
 tmp.*
+test_logs/
+test_reports/

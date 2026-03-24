@@ -8,9 +8,10 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import warnings
 
-# 导入外部因子与过滤器模块（与主回测逻辑解耦）
+# 导入外部模块（因子、过滤器、策略函数）
 import factors
 import filters
+import strategies
 
 warnings.filterwarnings("ignore")
 # 设置绘图中文与负号显示（用于可视化输出）
@@ -130,6 +131,7 @@ class VectorbtRotationStrategy:
             print(f"⚠️ 警告: 指定避险资产 '{self.safe_asset_code}' 未加载到行情，退化为持有现金（空仓）。")
 
         return target_weights
+    
     def run_backtest(self, target_weights, init_cash=100000, fees=0.0001, rebalance_freq='D'):
         """执行回测并返回 vectorbt 的 Portfolio 对象。
 
@@ -182,6 +184,7 @@ class VectorbtRotationStrategy:
             size_type='targetpercent',
             group_by=True,
             cash_sharing=True,
+            call_seq='auto',  # 智能排序，先卖后买
             init_cash=init_cash,
             fees=fees,
             slippage=0.000,
@@ -189,56 +192,132 @@ class VectorbtRotationStrategy:
         )
         print("✅ 回测完成！")
         return pf
-    
 
-def generate_donchian_rotation_weights(strategy, window=20):
-    """
-    海龟通道 + 动量轮动 状态机生成目标权重
-    """
-    print(f"🐢 正在生成 海龟+动量轮动 目标权重 (窗口: {window}日)...")
-    
-    # 提取风险资产数据
-    risk_codes = strategy.code_list
-    prices = strategy.prices[risk_codes]
-    highs = strategy.highs[risk_codes]
-    lows = strategy.lows[risk_codes]
-    
-    # 1. 计算轮动排序：现价相对于N日前收盘价的涨幅
-    momentum = prices / prices.shift(window) - 1.0
-    
-    # 使用 method='first' 保证每天即使有涨幅相同的，也只选出唯一的一个第一名
-    ranks = momentum.rank(axis=1, ascending=False, method='first')
-    is_rank1 = (ranks == 1) # 布尔型 DataFrame，标记每天的第一名
-    
-    # 2. 计算唐奇安通道（20日最高、最低点），shift(1) 避免未来函数
-    high_20 = highs.shift(1).rolling(window).max()
-    low_20 = lows.shift(1).rolling(window).min()
-    
-    # 3. 构建核心信号矩阵 (布尔型)
-    # 【开仓条件】：必须是当天的第一名，且现价突破前20日最高点
-    entry_signal = is_rank1 & (prices > high_20)
-    
-    # 【平仓条件】：不再是第一名（排名变更），或者 现价跌破前20日最低点
-    exit_signal = (~is_rank1) | (prices < low_20)
-    
-    # 4. 向量化状态机核心：利用 NaN 和 ffill (前向填充) 传播持仓状态
-    signals = pd.DataFrame(np.nan, index=prices.index, columns=prices.columns)
-    
-    # 赋值信号（注：因为平仓包含~is_rank1，开仓包含is_rank1，所以同一天绝对不会发生冲突）
-    signals[entry_signal] = 1.0
-    signals[exit_signal] = 0.0
-    
-    # 向前填充状态（1会一直延续到遇到0），最初始的 NaN 填 0
-    target_weights = signals.ffill().fillna(0.0)
-    
-    # 5. 处理避险资产分配
-    if strategy.safe_asset_code:
-        # 每行风险资产的权重总和 (因为限定了 rank1，最大和永远是 1)
-        risk_exposure = target_weights.sum(axis=1)
-        # 空仓部分自动买入国债/避险资产
-        target_weights[strategy.safe_asset_code] = 1.0 - risk_exposure
+    def save_trade_log(self, pf, log_title="trade_log", side_filter="buy"):
+        """提取并保存格式化的调仓交易日志。
         
-    return target_weights
+        :param pf: vectorbt 回测组合对象
+        :param log_title: 日志文件名前缀
+        :param side_filter: 过滤买卖方向。可选值: 'buy' (默认，仅买入), 'sell' (仅卖出), 'all' (全记录)
+        """
+        print(f"\n📂 正在提取调仓执行日志...")
+        
+        # 获取 vectorbt 原生的可读订单记录
+        orders_df = pf.orders.records_readable.copy()
+        
+        if orders_df.empty:
+            print("⚠️ 回测期间没有发生任何交易，未生成日志！")
+            return
+
+        def parse_side(val):
+            val_str = str(val).lower()
+            if val_str in ['0', '0.0', 'buy']:
+                return '买入 (B)'
+            elif val_str in ['1', '1.0', 'sell']:
+                return '卖出 (S)'
+            return '未知'
+            
+        orders_df['买卖方向'] = orders_df['Side'].apply(parse_side)
+        
+        if side_filter == 'buy':
+            orders_df = orders_df[orders_df['买卖方向'] == '买入 (B)']
+        elif side_filter == 'sell':
+            orders_df = orders_df[orders_df['买卖方向'] == '卖出 (S)']
+        elif side_filter == 'all':
+            pass  # 不过滤，保留全部记录
+        else:
+            print(f"⚠️ 无效的 side_filter 参数: '{side_filter}'，默认使用 'buy' 过滤。")
+            orders_df = orders_df[orders_df['买卖方向'] == '买入 (B)']
+        
+        # 再次检查过滤后是否还有数据
+        if orders_df.empty:
+            print(f"⚠️ 按照 '{side_filter}' 规则过滤后，没有符合条件的交易记录，未生成日志！")
+            return
+            
+        # 提取计算列前建议 copy 一下，避免 SettingWithCopyWarning
+        orders_df = orders_df.copy()
+
+        # # 2. 交易数量：四舍五入到整数，并取绝对值
+        # orders_df['交易数量'] = np.round(np.abs(orders_df['Size'])).astype(int)
+        trade_value = np.abs(orders_df['Size']) * orders_df['Price']
+        orders_df['实际收付'] = np.where(
+            orders_df['Size'] > 0, 
+            trade_value + orders_df['Fees'],  # 买入：实际支出
+            trade_value - orders_df['Fees']   # 卖出：实际收入
+        )
+        
+        # 3. 增加标的名称映射
+        # 构建一个完整的代码->名称映射字典 (包含风险资产和避险资产)
+        full_name_map = self.code_dict.copy()
+        if getattr(self, 'safe_asset_code', None): # 使用 getattr 防止 self 中没有该属性报错
+            # 因为避险资产在传入时只是一个字符串，我们在日志里给它加上标识
+            full_name_map[self.safe_asset_code] = f"避险资产({self.safe_asset_code})"
+
+        # 将 Column (标的代码) 映射为名称，如果字典里没有，就默认显示代码本身
+        orders_df['标的名称'] = orders_df['Column'].map(full_name_map).fillna(orders_df['Column'])
+        
+        # 4. 重命名其余列名以提升可读性
+        orders_df = orders_df.rename(columns={
+            'Column': '标的代码',
+            'Timestamp': '调仓日期',
+            'Price': '成交价格',
+            'Fees': '手续费'
+        })
+        
+        # 5. 筛选核心列并排序
+        log_columns = ['调仓日期', '标的代码', '买卖方向', '成交价格', '手续费', '实际收付', '标的名称']
+        formatted_log = orders_df[log_columns].copy()
+        
+        # 因为现在可能只有买入，保险起见依然保留排序逻辑
+        formatted_log['sort_side'] = formatted_log['买卖方向'].map({'卖出 (S)': 0, '买入 (B)': 1}).fillna(2)
+        formatted_log = formatted_log.sort_values(by=['调仓日期', 'sort_side', '标的代码'])
+        formatted_log = formatted_log.drop(columns=['sort_side'])
+        
+        # 6. 保留适当的小数位数
+        formatted_log['成交价格'] = formatted_log['成交价格'].map('{:.3f}'.format)
+        formatted_log['手续费'] = formatted_log['手续费'].map('{:.2f}'.format)
+        formatted_log['实际收付'] = formatted_log['实际收付'].map('{:.2f}'.format)
+        
+        # 创建目录并保存
+        import os
+        from datetime import datetime
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        full_log_dir = os.path.join(base_dir, 'test_logs')
+        os.makedirs(full_log_dir, exist_ok=True)
+        
+        # 在文件名中体现过滤规则，方便区分
+        log_filename = f"{log_title}_{side_filter}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        log_path = os.path.join(full_log_dir, log_filename)
+        
+        # 存为带 BOM 的 CSV，防止 Excel 打开时中文乱码
+        formatted_log.to_csv(log_path, index=False, encoding='utf-8-sig')
+        print(f"✅ 调仓日志已保存至: {log_path}")
+        
+        # 在控制台打印最近几条记录的预览
+        print(f"\n🔍 最近 5 笔调仓记录预览 (模式: {side_filter}):")
+        print(formatted_log.tail(5).to_markdown(index=False))
+
+    @staticmethod
+    def generate_html_report(report_title, strategy_returns, benchmark_returns):
+        """使用 QuantStats 生成 HTML 报告并保存到本地。
+        
+        参数说明：
+        - report_title: 报告标题
+        - strategy_returns: 策略的每日收益率序列
+        - benchmark_returns: 基准的每日收益率序列
+        """
+        report_name = f"{report_title}_{datetime.now().strftime('%Y%m%d_%H%M')}.html"
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        report_path = os.path.join(script_dir, 'test_reports', report_name)
+        qs.reports.html(
+            returns=strategy_returns,
+            benchmark=benchmark_returns,
+            title=report_title,
+            output=report_path,
+        )
+        print(f"✅ 报告已生成并保存至: {report_path}")
+
+
 
 def main():
     # 数据库路径（相对 __file__ 的位置）
@@ -265,7 +344,7 @@ def main():
     SAFE_ASSET_CODE = '161119'  # '161119'-易方达新综债LOF，'511880'-银华日利
     REPORT_TITLE = "ETF Rotation"
     
-    # 2. 实例化策略框架（构建并加载行情数据）
+    # 实例化策略框架（构建并加载行情数据）
     strategy = VectorbtRotationStrategy(
         db_path=DB_PATH,
         code_dict=ETF_DICT,
@@ -277,6 +356,8 @@ def main():
         # end_date='20260101',
         # start_date='20230301',  # 3年数据，部分ETF上市较晚
         # end_date='20260301',
+        start_date='20250901',  # 短时测试周期
+        end_date='20260320',
     )
 
     # 获取风险资产的价格/最高/最低（用于因子与过滤器计算）
@@ -298,18 +379,18 @@ def main():
     # mov_avg_mask = filters.filter_moving_average(risk_prices, window=120)
     # combined_mask = rsrs_safe_mask & drop_safe_mask
 
-    # 3. 根据因子与过滤器生成每日目标权重
+    # 根据因子与过滤器生成每日目标权重
     weights = strategy.generate_target_weights(
         factor,
         top_n=1,
-        # pre_filter_mask=abs_mom_mask,
+        # pre_filter_mask=drop_safe_mask,
         # post_filter_mask=abs_mom_mask,       
     )
 
-    # weights = generate_donchian_rotation_weights(strategy, window=20)  # 海龟通道 + 动量轮动 状态机生成目标权重
+    # 外部策略函数
+    # weights = strategies.generate_donchian_rotation_weights(strategy, window=20)  # 海龟通道 + 动量轮动 状态机生成目标权重
 
     # 运行回测并获取 Portfolio 结果
-    # pf = strategy.run_backtest(weights_atr, init_cash=100000, fees=0.00006)
     pf = strategy.run_backtest(
         weights,
         init_cash=100000,
@@ -317,29 +398,22 @@ def main():
         rebalance_freq='D',  # 'D', 'W', '2W', 'M', 'Q', 'Y', 调仓频率
     )
 
-    # # 4. 打印回测基本统计
+    # 提取并保存调仓日志
+    strategy.save_trade_log(pf, log_title=REPORT_TITLE)
+
+    # # 打印回测基本统计
     # print("\n" + "=" * 40)
-    # print("📈 回测基础统计指标")
+    # print("📈 VectorBT 回测基础统计指标")
     # print("=" * 40)
     # print(pf.stats())
 
-    # 5. 使用 QuantStats 生成 HTML 报告
+    # 使用 QuantStats 生成 HTML 报告
     print("\n📝 正在生成 QuantStats HTML 报告...")
     strategy_returns = pf.returns()
     benchmark_returns = strategy.prices[BENCHMARK_CODE].pct_change().fillna(0)
     strategy_returns, benchmark_returns = strategy_returns.align(benchmark_returns, join='inner')
     qs.reports.metrics(strategy_returns, benchmark=benchmark_returns, mode='basic')
-
-    # report_name = f"{REPORT_TITLE}_{datetime.now().strftime('%Y%m%d_%H%M')}.html"
-    # script_dir = os.path.dirname(os.path.abspath(__file__))
-    # report_path = os.path.join(script_dir, 'test_reports', report_name)
-    # qs.reports.html(
-    #     returns=strategy_returns,
-    #     benchmark=benchmark_returns,
-    #     title=REPORT_TITLE,
-    #     output=report_path,
-    # )
-    # print(f"✅ 报告已生成并保存至: {report_path}")
+    # strategy.generate_html_report(REPORT_TITLE, strategy_returns, benchmark_returns)  # 保存本地报告
 
     # 若需要交互式展示，可取消下一行注释
     # pf.plot().show()
