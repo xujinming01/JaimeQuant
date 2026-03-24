@@ -21,6 +21,7 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.13' # 可根据你本地实际的 Python 版本修改
+        cache: 'pip'            # 缓存 pip 安装的包，加速后续运行
 
     - name: Install dependencies
       # 这里把需要的库装上。如果你的 factors.py 或 filters.py 用到了 scipy 或 ta 等，也要在这里加进去

@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 import warnings
+import concurrent.futures
 
 import factors
 import filters
@@ -124,18 +125,32 @@ def get_realtime_daily_k(symbol, lookback_days=400):
     daily_df = daily_df.sort_index()
     return daily_df.tail(lookback_days)
 
+def fetch_worker(code):
+    try:
+        df = get_realtime_daily_k(code, lookback_days=LOOKBACK_DAYS)
+        return code, df
+    except Exception as e:
+        print(f"❌ 获取 {code} 数据彻底失败: {e}")
+        return code, None
+
 def main():
     
     print(f"🕒 正在实时抓取数据并合成今日(截至14:50) 的 K 线特征...")
     
     close_list, high_list, low_list = [], [],[]
     
-    for code, name in ETF_DICT.items():
-        # print(f"📥 获取 {name} ({code})...")
-        df = get_realtime_daily_k(code, lookback_days=LOOKBACK_DAYS)
-        close_list.append(df[['收盘']].rename(columns={'收盘': code}))
-        high_list.append(df[['最高']].rename(columns={'最高': code}))
-        low_list.append(df[['最低']].rename(columns={'最低': code}))
+    # max_workers=5 表示同时发起 5 个请求。对于东方财富的接口，5~8 是比较安全的并发数，太高容易被封 IP
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        # executor.map 会保持返回结果与传入字典键的顺序一致
+        results = executor.map(fetch_worker, ETF_DICT.keys())
+        
+    for code, df in results:
+        if df is not None and not df.empty:
+            close_list.append(df[['收盘']].rename(columns={'收盘': code}))
+            high_list.append(df[['最高']].rename(columns={'最高': code}))
+            low_list.append(df[['最低']].rename(columns={'最低': code}))
+        else:
+            print(f"⚠️ 跳过 {ETF_DICT[code]} ({code}) 的拼接")
         
     prices = pd.concat(close_list, axis=1).ffill()
     highs = pd.concat(high_list, axis=1).ffill()
